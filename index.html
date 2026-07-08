@@ -1,0 +1,1314 @@
+<!doctype html>
+<html lang="en" data-accent="crimson">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Card Vault — Appraisal &amp; Inventory</title>
+<meta name="description" content="Offline-first appraisal and inventory workspace for trading card shops." />
+<meta name="theme-color" content="#B3261E" />
+<link rel="manifest" href="./manifest.json" />
+<link rel="icon" href="./icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="./icon.svg" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+<!-- Tailwind (utility CSS, JIT engine bundled — no build step) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Extend Tailwind with a data-font-mono utility and disable the default
+  // preflight overriding our custom scrollbar / focus-ring styles below.
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'Helvetica Neue', 'Arial', 'sans-serif'],
+          mono: ['ui-monospace', 'SFMono-Regular', 'SF Mono', 'Menlo', 'Consolas', 'Liberation Mono', 'monospace'],
+        },
+        animation: { 'fade-in': 'fadeIn .15s ease-out', 'slide-up': 'slideUp .2s ease-out' },
+        keyframes: {
+          fadeIn: { '0%': { opacity: 0 }, '100%': { opacity: 1 } },
+          slideUp: { '0%': { opacity: 0, transform: 'translateY(6px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } },
+        },
+      },
+    },
+  };
+</script>
+
+<!-- React 18 + htm (tagged-template JSX substitute — zero build step, zero Babel parse cost) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.js" crossorigin></script>
+<!-- PapaParse for CSV import -->
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js" crossorigin></script>
+<!-- Lucide icon set (renders inline SVG from <i data-lucide="name">) -->
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js" crossorigin></script>
+
+<style>
+  /* ---- Accent theme tokens. Four palettes selectable from Settings. ---- */
+  html[data-accent="crimson"]  { --accent: #C22B26; --accent-hover:#A9231E; --accent-soft: rgba(194,43,38,.14); --ring:#F0928C; }
+  html[data-accent="cobalt"]   { --accent: #2354C7; --accent-hover:#1D46A8; --accent-soft: rgba(35,84,199,.14); --ring:#8FADEE; }
+  html[data-accent="emerald"]  { --accent: #1F7A52; --accent-hover:#186641; --accent-soft: rgba(31,122,82,.14);  --ring:#7FCBAA; }
+  html[data-accent="electric"] { --accent: #B5900B; --accent-hover:#977809; --accent-soft: rgba(181,144,11,.16); --ring:#E9C24C; }
+
+  html, body { background:#0B0D10; }
+  * { -webkit-tap-highlight-color: transparent; }
+  body { font-feature-settings: "tnum" 1, "cv11" 1; }
+  .font-tabular { font-variant-numeric: tabular-nums; }
+
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2A2E35; border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3A3F47; }
+
+  .focus-ring:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+  /* Foil sheen sweep used on the selected-card preview — the app's one
+     "signature" flourish, referencing the holo-foil surface of a real card. */
+  @keyframes foilSweep { 0% { background-position: -150% 0; } 100% { background-position: 250% 0; } }
+  .foil-sheen {
+    background-image: linear-gradient(115deg, transparent 40%, rgba(255,255,255,.16) 50%, transparent 60%);
+    background-size: 250% 100%;
+    animation: foilSweep 2.8s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .foil-sheen { animation: none; }
+    .animate-fade-in, .animate-slide-up { animation: none !important; }
+  }
+
+  /* Grading-slab style label used for the condition badges — a small nod
+     to real PSA/CGC slab labels without reproducing any brand's mark. */
+  .slab-badge {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .04em;
+  }
+</style>
+</head>
+<body class="bg-[#0B0D10] text-zinc-100 font-sans antialiased min-h-screen">
+<div id="root"></div>
+
+<script>
+"use strict";
+/* =========================================================================
+   CARD VAULT — offline-first appraisal & inventory workspace
+   Single-file React app (no build step). See README.md for architecture
+   notes, especially why the pricing engine uses the pokemontcg.io /
+   TCGplayer & Cardmarket data instead of scraping eBay's sold listings.
+   ========================================================================= */
+
+const html = htm.bind(React.createElement);
+const { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } = React;
+
+/* ---------------------------------------------------------------------- *
+ * Constants
+ * ---------------------------------------------------------------------- */
+
+const STORAGE_KEYS = {
+  settings: "cardvault:settings:v1",
+  inventory: "cardvault:inventory:v1",
+  modCounter: "cardvault:modCounter:v1",
+  cachePrefix: "cardvault:cache:v1:",
+};
+
+const ACCENTS = {
+  crimson:  { key: "crimson",  label: "Charizard Crimson"  },
+  cobalt:   { key: "cobalt",   label: "Blastoise Cobalt"   },
+  emerald:  { key: "emerald",  label: "Venusaur Emerald"   },
+  electric: { key: "electric", label: "Pikachu Electric"   },
+};
+
+const DEFAULT_SETTINGS = {
+  shopName: "Sam's Card Vault",
+  themeAccent: "crimson",
+  pokemonApiKey: "",
+  marginPercent: 75,
+  pricingBasis: "market", // market | low | mid | high  (see README for why this replaced the eBay day-window filter)
+  autoBackupEnabled: true,
+  autoBackupThreshold: 15,
+};
+
+// Condition buckets shown after a manual "Run Market Price Scan".
+// nm/lp/mp are computed from the TCGplayer base price via multiplier.
+// graded has no reliable free data source, so it is manual-entry only.
+const CONDITION_BUCKETS = [
+  { key: "graded", label: "Graded Slabs", sub: "PSA / BGS / CGC — enter your own comp", computed: false },
+  { key: "nm",     label: "Raw Near Mint (NM)",            sub: "100% of base price",         computed: true, multiplier: 1.00 },
+  { key: "lp",     label: "Raw Lightly Played (LP)",       sub: "≈85% of base price (est.)",   computed: true, multiplier: 0.85 },
+  { key: "mp",     label: "Raw Played / Damaged (MP–HP–DMG)", sub: "≈60% of base price (est.)", computed: true, multiplier: 0.60 },
+];
+
+const PRICING_BASIS_OPTIONS = [
+  { key: "market", label: "Market Price (recommended)" },
+  { key: "low",    label: "Low" },
+  { key: "mid",    label: "Mid" },
+  { key: "high",   label: "High" },
+];
+
+const VARIANT_LABELS = {
+  normal: "Normal",
+  holofoil: "Holofoil",
+  reverseHolofoil: "Reverse Holofoil",
+  "1stEditionNormal": "1st Edition",
+  "1stEditionHolofoil": "1st Edition Holofoil",
+  unlimitedHolofoil: "Unlimited Holofoil",
+  unlimited: "Unlimited",
+};
+
+const CSV_TEMPLATE_HEADERS = ["Card Name", "Set Name", "Card Number", "Condition", "Variant", "Quantity", "Cost Basis", "Notes"];
+
+/* ---------------------------------------------------------------------- *
+ * Small pure helpers
+ * ---------------------------------------------------------------------- */
+
+function uid() {
+  return "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function clsx(...args) {
+  return args.filter(Boolean).join(" ");
+}
+
+function formatCurrency(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return v.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+function timeAgo(iso) {
+  if (!iso) return "never";
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+function debounce(fn, ms) {
+  let t = null;
+  const debounced = (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+  debounced.cancel = () => clearTimeout(t);
+  return debounced;
+}
+
+function safeReadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Card Vault: failed to read", key, e);
+    return fallback;
+  }
+}
+
+function safeWriteJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.warn("Card Vault: failed to persist", key, e);
+    return false;
+  }
+}
+
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadText(text, filename, mime) {
+  const blob = new Blob([text], { type: mime || "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function timestampForFilename() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+/* ---------------------------------------------------------------------- *
+ * Network layer — fetchWithRetry (timeout + exponential backoff) plus a
+ * localStorage-backed cache so lookups made once at a show still work if
+ * the venue wifi drops a minute later.
+ * ---------------------------------------------------------------------- */
+
+async function fetchWithRetry(url, options = {}, { retries = 2, timeoutMs = 9000, backoffMs = 700 } = {}) {
+  let attempt = 0;
+  let lastErr = null;
+  while (attempt <= retries) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+      return await res.json();
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      attempt += 1;
+      if (attempt > retries) break;
+      await new Promise((r) => setTimeout(r, backoffMs * attempt));
+    }
+  }
+  throw lastErr || new Error("Request failed");
+}
+
+function cacheGet(key) {
+  const wrapped = safeReadJSON(STORAGE_KEYS.cachePrefix + key, null);
+  if (!wrapped) return null;
+  return wrapped; // { data, cachedAt }
+}
+function cacheSet(key, data) {
+  safeWriteJSON(STORAGE_KEYS.cachePrefix + key, { data, cachedAt: new Date().toISOString() });
+}
+
+// pokemontcg.io — used for both autocomplete AND pricing (tcgplayer + cardmarket
+// fields come embedded on the card object). See README for why this replaced
+// the originally-specified eBay sold-listing scrape.
+const POKEMONTCG_BASE = "https://api.pokemontcg.io/v2";
+
+async function searchCards(query, apiKey) {
+  const cacheKey = "search:" + query.trim().toLowerCase();
+  const cached = cacheGet(cacheKey);
+  try {
+    const q = encodeURIComponent(`name:"${query.replace(/"/g, "")}*"`);
+    const url = `${POKEMONTCG_BASE}/cards?q=${q}&pageSize=8&orderBy=name`;
+    const headers = apiKey ? { "X-Api-Key": apiKey } : {};
+    const json = await fetchWithRetry(url, { headers }, { retries: 1, timeoutMs: 7000 });
+    const data = json?.data || [];
+    cacheSet(cacheKey, data);
+    return { data, fromCache: false };
+  } catch (err) {
+    if (cached) return { data: cached.data, fromCache: true, cachedAt: cached.cachedAt, error: err };
+    throw err;
+  }
+}
+
+async function fetchCardById(id, apiKey) {
+  const cacheKey = "card:" + id;
+  const cached = cacheGet(cacheKey);
+  try {
+    const headers = apiKey ? { "X-Api-Key": apiKey } : {};
+    const json = await fetchWithRetry(`${POKEMONTCG_BASE}/cards/${id}`, { headers }, { retries: 2, timeoutMs: 9000 });
+    const data = json?.data || null;
+    if (data) cacheSet(cacheKey, data);
+    return { data, fromCache: false };
+  } catch (err) {
+    if (cached) return { data: cached.data, fromCache: true, cachedAt: cached.cachedAt, error: err };
+    throw err;
+  }
+}
+
+/* Derive the four condition-bucket prices from a card's tcgplayer pricing
+   for a chosen variant (normal / holofoil / etc.) and basis (market/low/mid/high). */
+function computeConditionPrices(card, variantKey, basisKey) {
+  const variantPrices = card?.tcgplayer?.prices?.[variantKey];
+  if (!variantPrices) return null;
+  const base = variantPrices[basisKey] ?? variantPrices.market ?? variantPrices.mid ?? variantPrices.low ?? null;
+  if (base == null || !Number.isFinite(base)) return null;
+  return {
+    nm: base * 1.00,
+    lp: base * 0.85,
+    mp: base * 0.60,
+    baseUsed: base,
+  };
+}
+
+function availableVariants(card) {
+  const prices = card?.tcgplayer?.prices;
+  if (!prices) return [];
+  return Object.keys(prices);
+}
+
+/* ---------------------------------------------------------------------- *
+ * Hooks
+ * ---------------------------------------------------------------------- */
+
+function usePersistentState(key, fallback) {
+  const [state, setState] = useState(() => safeReadJSON(key, fallback));
+  useEffect(() => { safeWriteJSON(key, state); }, [key, state]);
+  return [state, setState];
+}
+
+function useOnlineStatus() {
+  const [online, setOnline] = useState(navigator.onLine);
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
+  }, []);
+  return online;
+}
+
+let toastId = 0;
+function useToasts() {
+  const [toasts, setToasts] = useState([]);
+  const push = useCallback((message, kind = "info", timeout = 3800) => {
+    const id = ++toastId;
+    setToasts((t) => [...t, { id, message, kind }]);
+    if (timeout) setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), timeout);
+  }, []);
+  const dismiss = useCallback((id) => setToasts((t) => t.filter((x) => x.id !== id)), []);
+  return { toasts, push, dismiss };
+}
+
+// Re-scans the DOM for <i data-lucide="..."> and swaps in inline SVGs.
+// Cheap operation; safe to call after every render that might add icons.
+function useLucideIcons(deps) {
+  useLayoutEffect(() => {
+    if (window.lucide) window.lucide.createIcons();
+  });
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * UI atoms
+ * ---------------------------------------------------------------------- */
+
+function Button({ children, onClick, variant = "default", size = "md", className, disabled, type = "button", title }) {
+  const base = "inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors focus-ring disabled:opacity-40 disabled:cursor-not-allowed select-none";
+  const sizes = { sm: "text-xs px-2.5 py-1.5", md: "text-sm px-3.5 py-2.5", lg: "text-base px-5 py-3" };
+  const variants = {
+    default: "text-white shadow-sm",
+    ghost: "bg-white/5 hover:bg-white/10 text-zinc-200",
+    outline: "border border-white/15 hover:bg-white/5 text-zinc-100",
+    danger: "bg-red-950/60 hover:bg-red-900/70 text-red-300 border border-red-900/60",
+    subtle: "bg-white/[.04] hover:bg-white/[.08] text-zinc-300",
+  };
+  const style = variant === "default" ? { backgroundColor: "var(--accent)" } : undefined;
+  return html`
+    <button type=${type} title=${title} disabled=${disabled} onClick=${onClick} style=${style}
+      class=${clsx(base, sizes[size], variants[variant], className)}
+      onMouseEnter=${variant === "default" ? (e) => (e.currentTarget.style.backgroundColor = "var(--accent-hover)") : undefined}
+      onMouseLeave=${variant === "default" ? (e) => (e.currentTarget.style.backgroundColor = "var(--accent)") : undefined}>
+      ${children}
+    </button>`;
+}
+
+function IconBtn({ name, onClick, title, className, size = 18 }) {
+  return html`
+    <button type="button" title=${title} onClick=${onClick}
+      class=${clsx("inline-flex items-center justify-center rounded-lg p-2 bg-white/5 hover:bg-white/10 text-zinc-300 focus-ring transition-colors", className)}>
+      <i data-lucide=${name} style=${{ width: size, height: size }}></i>
+    </button>`;
+}
+
+function Field({ label, hint, children }) {
+  return html`
+    <label class="block">
+      <span class="block text-xs font-medium text-zinc-400 mb-1.5">${label}</span>
+      ${children}
+      ${hint ? html`<span class="block text-[11px] text-zinc-500 mt-1">${hint}</span>` : null}
+    </label>`;
+}
+
+function TextInput({ value, onChange, placeholder, type = "text", className }) {
+  return html`
+    <input type=${type} value=${value} placeholder=${placeholder}
+      onInput=${(e) => onChange(e.target.value)}
+      class=${clsx("w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus-ring focus:border-white/20", className)} />`;
+}
+
+function NumberInput({ value, onChange, min, max, step = 1, className, suffix }) {
+  return html`
+    <div class="relative">
+      <input type="number" value=${value} min=${min} max=${max} step=${step}
+        onInput=${(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))}
+        class=${clsx("w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2.5 text-sm text-zinc-100 font-tabular focus-ring focus:border-white/20", suffix ? "pr-8" : "", className)} />
+      ${suffix ? html`<span class="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-zinc-500">${suffix}</span>` : null}
+    </div>`;
+}
+
+function Select({ value, onChange, options, className }) {
+  return html`
+    <div class="relative">
+      <select value=${value} onChange=${(e) => onChange(e.target.value)}
+        class=${clsx("w-full appearance-none rounded-lg bg-white/5 border border-white/10 px-3 py-2.5 pr-9 text-sm text-zinc-100 focus-ring focus:border-white/20", className)}>
+        ${options.map((o) => html`<option key=${o.key} value=${o.key}>${o.label}</option>`)}
+      </select>
+      <i data-lucide="chevron-down" class="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500" style=${{ width: 16, height: 16 }}></i>
+    </div>`;
+}
+
+function Toggle({ checked, onChange, label }) {
+  return html`
+    <button type="button" onClick=${() => onChange(!checked)}
+      class="flex items-center gap-3 focus-ring rounded-lg" >
+      <span class=${clsx("relative inline-flex h-6 w-11 items-center rounded-full transition-colors", checked ? "" : "bg-white/10")}
+            style=${checked ? { backgroundColor: "var(--accent)" } : undefined}>
+        <span class=${clsx("inline-block h-5 w-5 transform rounded-full bg-white transition-transform", checked ? "translate-x-6" : "translate-x-1")}></span>
+      </span>
+      ${label ? html`<span class="text-sm text-zinc-300">${label}</span>` : null}
+    </button>`;
+}
+
+function Badge({ children, tone = "zinc" }) {
+  const tones = {
+    zinc: "bg-white/[.06] text-zinc-300 border-white/10",
+    green: "bg-emerald-500/10 text-emerald-300 border-emerald-500/20",
+    red: "bg-red-500/10 text-red-300 border-red-500/20",
+    amber: "bg-amber-500/10 text-amber-300 border-amber-500/20",
+  };
+  return html`<span class=${clsx("inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium slab-badge", tones[tone])}>${children}</span>`;
+}
+
+function Modal({ open, onClose, title, children, wide }) {
+  if (!open) return null;
+  return html`
+    <div class="fixed inset-0 z-50 flex items-end sm:items-center justify-center animate-fade-in">
+      <div class="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick=${onClose}></div>
+      <div class=${clsx("relative w-full sm:rounded-2xl rounded-t-2xl bg-[#111417] border border-white/10 shadow-2xl animate-slide-up max-h-[92vh] overflow-y-auto", wide ? "sm:max-w-2xl" : "sm:max-w-md")}>
+        <div class="sticky top-0 flex items-center justify-between px-5 py-4 border-b border-white/10 bg-[#111417]/95 backdrop-blur">
+          <h3 class="text-base font-semibold text-zinc-100">${title}</h3>
+          <${IconBtn} name="x" onClick=${onClose} title="Close" />
+        </div>
+        <div class="p-5">${children}</div>
+      </div>
+    </div>`;
+}
+
+function ToastStack({ toasts, dismiss }) {
+  const icon = { success: "check-circle-2", error: "alert-triangle", info: "info" };
+  const tone = { success: "border-emerald-500/30 bg-emerald-950/80 text-emerald-200", error: "border-red-500/30 bg-red-950/80 text-red-200", info: "border-white/15 bg-[#15181C]/95 text-zinc-200" };
+  return html`
+    <div class="fixed z-[60] bottom-20 sm:bottom-5 left-1/2 -translate-x-1/2 w-[92%] sm:w-auto flex flex-col gap-2 items-center">
+      ${toasts.map((t) => html`
+        <div key=${t.id} onClick=${() => dismiss(t.id)}
+          class=${clsx("flex items-center gap-2 rounded-xl border px-4 py-2.5 text-sm shadow-lg backdrop-blur cursor-pointer animate-slide-up", tone[t.kind] || tone.info)}>
+          <i data-lucide=${icon[t.kind] || icon.info} style=${{ width: 16, height: 16 }}></i>
+          <span>${t.message}</span>
+        </div>`)}
+    </div>`;
+}
+
+function OfflineBanner({ online }) {
+  if (online) return null;
+  return html`
+    <div class="flex items-center gap-2 justify-center bg-amber-500/10 border-b border-amber-500/20 text-amber-300 text-xs sm:text-sm px-3 py-2">
+      <i data-lucide="wifi-off" style=${{ width: 14, height: 14 }}></i>
+      <span>You're offline — inventory changes are saved on this device. Price lookups will retry once you're back online.</span>
+    </div>`;
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * Settings drawer
+ * ---------------------------------------------------------------------- */
+
+function SettingsDrawer({ open, onClose, settings, setSettings, onExport, onImport, inventoryCount }) {
+  const fileRef = useRef(null);
+  const [mergeImport, setMergeImport] = useState(true);
+  const set = (patch) => setSettings((s) => ({ ...s, ...patch }));
+
+  return html`
+    <div class=${clsx("fixed inset-0 z-40 transition-opacity", open ? "pointer-events-auto" : "pointer-events-none opacity-0")}>
+      <div class=${clsx("absolute inset-0 bg-black/60 transition-opacity", open ? "opacity-100" : "opacity-0")} onClick=${onClose}></div>
+      <div class=${clsx("absolute inset-y-0 right-0 w-full sm:w-[420px] bg-[#111417] border-l border-white/10 shadow-2xl transition-transform overflow-y-auto", open ? "translate-x-0" : "translate-x-full")}>
+        <div class="sticky top-0 z-10 flex items-center justify-between px-5 py-4 border-b border-white/10 bg-[#111417]/95 backdrop-blur">
+          <h2 class="text-base font-semibold">Settings</h2>
+          <${IconBtn} name="x" onClick=${onClose} title="Close settings" />
+        </div>
+
+        <div class="p-5 space-y-7">
+
+          <!-- Onboarding / upgrades guide -->
+          <div class="rounded-xl border border-white/10 bg-white/[.03] p-4 space-y-3">
+            <div class="flex items-center gap-2 text-sm font-semibold text-zinc-100">
+              <i data-lucide="rocket" style=${{ width: 16, height: 16 }}></i> Workspace upgrades
+            </div>
+            <div class="space-y-1.5">
+              <p class="text-xs text-zinc-400 leading-relaxed">
+                <span class="text-zinc-200 font-medium">Step 1 —</span> get a free pokemontcg.io API key to raise autocomplete &amp; pricing lookups from 100/day to 20,000/day. Sign up at
+                <a class="underline decoration-dotted" href="https://pokemontcg.io" target="_blank" rel="noopener">pokemontcg.io</a>, then paste it below.
+              </p>
+            </div>
+            <p class="text-xs text-zinc-500 leading-relaxed">
+              Pricing (TCGplayer &amp; Cardmarket) comes from the same API and the same key — there's no separate scraping key to manage, and nothing to bypass on eBay's end. See the README for why.
+            </p>
+          </div>
+
+          <!-- Branding -->
+          <div class="space-y-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Branding</h3>
+            <${Field} label="Shop name">
+              <${TextInput} value=${settings.shopName} onChange=${(v) => set({ shopName: v })} placeholder="Your shop name" />
+            <//>
+            <${Field} label="Theme accent">
+              <${Select} value=${settings.themeAccent} onChange=${(v) => set({ themeAccent: v })}
+                options=${Object.values(ACCENTS).map((a) => ({ key: a.key, label: a.label }))} />
+            <//>
+          </div>
+
+          <!-- API -->
+          <div class="space-y-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Pokémon TCG API</h3>
+            <${Field} label="API key" hint="Optional but recommended — raises your daily rate limit substantially.">
+              <${TextInput} value=${settings.pokemonApiKey} onChange=${(v) => set({ pokemonApiKey: v })} placeholder="Paste your pokemontcg.io key" />
+            <//>
+          </div>
+
+          <!-- Pricing engine controls -->
+          <div class="space-y-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Appraisal &amp; margin</h3>
+            <${Field} label=${`Store buying margin — ${settings.marginPercent}%`} hint="Cash offer = margin × the selected condition's price.">
+              <div class="flex items-center gap-3">
+                <input type="range" min="10" max="100" step="1" value=${settings.marginPercent}
+                  onInput=${(e) => set({ marginPercent: Number(e.target.value) })}
+                  class="w-full accent-[var(--accent)]" />
+                <${NumberInput} value=${settings.marginPercent} onChange=${(v) => set({ marginPercent: v })} min=${0} max=${100} suffix="%" className="w-24" />
+              </div>
+            <//>
+            <${Field} label="Pricing basis" hint="Which TCGplayer price point to treat as the Near-Mint baseline for each scan.">
+              <${Select} value=${settings.pricingBasis} onChange=${(v) => set({ pricingBasis: v })} options=${PRICING_BASIS_OPTIONS} />
+            <//>
+          </div>
+
+          <!-- Backup -->
+          <div class="space-y-4">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Data safety</h3>
+            <${Toggle} checked=${settings.autoBackupEnabled} onChange=${(v) => set({ autoBackupEnabled: v })} label="Auto-backup on modifications" />
+            ${settings.autoBackupEnabled ? html`
+              <${Field} label="Backup interval threshold" hint="Every N inventory changes, download a timestamped JSON snapshot automatically.">
+                <${NumberInput} value=${settings.autoBackupThreshold} onChange=${(v) => set({ autoBackupThreshold: Math.max(1, v || 1) })} min=${1} max=${500} />
+              <//>` : null}
+
+            <div class="grid grid-cols-2 gap-3 pt-1">
+              <${Button} variant="outline" onClick=${onExport}><i data-lucide="download" style=${{ width: 15, height: 15 }}></i> Export JSON<//>
+              <${Button} variant="outline" onClick=${() => fileRef.current?.click()}><i data-lucide="upload" style=${{ width: 15, height: 15 }}></i> Import JSON<//>
+            </div>
+            <label class="flex items-center gap-2 text-xs text-zinc-400">
+              <input type="checkbox" checked=${mergeImport} onChange=${(e) => setMergeImport(e.target.checked)} class="accent-[var(--accent)]" />
+              Merge with existing ${inventoryCount} item(s) instead of replacing
+            </label>
+            <input ref=${fileRef} type="file" accept="application/json" class="hidden"
+              onChange=${(e) => { const f = e.target.files?.[0]; if (f) onImport(f, mergeImport); e.target.value = ""; }} />
+          </div>
+
+        </div>
+      </div>
+    </div>`;
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * Tab 1 — Live Appraisal Counter
+ * ---------------------------------------------------------------------- */
+
+function AppraisalTab({ settings, online, pushToast, onBuy }) {
+  const [query, setQuery] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchNotice, setSearchNotice] = useState(null); // {cached:bool, cachedAt}
+
+  const [selectedCard, setSelectedCard] = useState(null);
+  const [variantKey, setVariantKey] = useState(null);
+
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanError, setScanError] = useState(null);
+  const [scanMeta, setScanMeta] = useState(null); // {fromCache, cachedAt}
+  const [bucketPrices, setBucketPrices] = useState(null); // {graded,nm,lp,mp}
+  const [overrideOn, setOverrideOn] = useState(false);
+  const [selectedBucket, setSelectedBucket] = useState("nm");
+  const [marginOverride, setMarginOverride] = useState(settings.marginPercent);
+  const [quantity, setQuantity] = useState(1);
+  const [costBasis, setCostBasis] = useState("");
+
+  useEffect(() => { setMarginOverride(settings.marginPercent); }, [settings.marginPercent]);
+
+  const runSearch = useMemo(() => debounce(async (q) => {
+    if (q.trim().length < 2) { setSuggestions([]); setShowSuggestions(false); return; }
+    setSearchLoading(true);
+    setSearchNotice(null);
+    try {
+      const { data, fromCache, cachedAt } = await searchCards(q, settings.pokemonApiKey);
+      setSuggestions(data);
+      setShowSuggestions(true);
+      if (fromCache) setSearchNotice({ cached: true, cachedAt });
+    } catch (err) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      pushToast("Card lookup failed — check your connection and try again.", "error");
+    } finally {
+      setSearchLoading(false);
+    }
+  }, 380), [settings.pokemonApiKey]);
+
+  const onQueryChange = (v) => { setQuery(v); runSearch(v); };
+
+  const pickCard = (card) => {
+    setSelectedCard(card);
+    const variants = availableVariants(card);
+    setVariantKey(variants[0] || null);
+    setQuery(`${card.name} — ${card.set?.name || ""}`);
+    setShowSuggestions(false);
+    setBucketPrices(null);
+    setScanError(null);
+    setScanMeta(null);
+    setOverrideOn(false);
+    setCostBasis("");
+  };
+
+  const runScan = async () => {
+    if (!selectedCard) return;
+    setScanLoading(true);
+    setScanError(null);
+    try {
+      const { data: fresh, fromCache, cachedAt } = await fetchCardById(selectedCard.id, settings.pokemonApiKey);
+      const card = fresh || selectedCard;
+      const variants = availableVariants(card);
+      const vKey = variants.includes(variantKey) ? variantKey : variants[0];
+      setVariantKey(vKey);
+      const computed = vKey ? computeConditionPrices(card, vKey, settings.pricingBasis) : null;
+      if (!computed) {
+        setScanError("No TCGplayer pricing is available for this card/variant yet. Enter values manually below.");
+        setBucketPrices({ graded: null, nm: null, lp: null, mp: null });
+        setOverrideOn(true);
+      } else {
+        setBucketPrices({ graded: null, nm: computed.nm, lp: computed.lp, mp: computed.mp });
+        setScanMeta({ fromCache, cachedAt });
+        if (fromCache) pushToast("Showing last cached prices — you're offline.", "info");
+      }
+    } catch (err) {
+      setScanError("Price scan failed — no connection and no cached price for this card. You can still enter values manually.");
+      setBucketPrices({ graded: null, nm: null, lp: null, mp: null });
+      setOverrideOn(true);
+    } finally {
+      setScanLoading(false);
+    }
+  };
+
+  const bucketPrice = (key) => {
+    if (!bucketPrices) return null;
+    return bucketPrices[key];
+  };
+
+  const selectedPrice = bucketPrice(selectedBucket);
+  const cashOffer = selectedPrice != null ? (selectedPrice * (marginOverride / 100)) : null;
+
+  const resetDraft = () => {
+    setSelectedCard(null); setVariantKey(null); setQuery("");
+    setBucketPrices(null); setScanError(null); setScanMeta(null);
+    setOverrideOn(false); setQuantity(1); setCostBasis("");
+  };
+
+  const confirmBuy = () => {
+    if (!selectedCard || selectedPrice == null) return;
+    const bucket = CONDITION_BUCKETS.find((b) => b.key === selectedBucket);
+    onBuy({
+      id: uid(),
+      cardId: selectedCard.id,
+      name: selectedCard.name,
+      setName: selectedCard.set?.name || "",
+      cardNumber: selectedCard.number || "",
+      imageSmall: selectedCard.images?.small || "",
+      variant: variantKey,
+      condition: selectedBucket,
+      conditionLabel: bucket?.label || selectedBucket,
+      quantity: Math.max(1, Number(quantity) || 1),
+      costBasis: costBasis === "" ? Number(cashOffer.toFixed(2)) : Number(costBasis),
+      marketPriceSnapshot: Number(selectedPrice.toFixed(2)),
+      cashOfferAtSync: Number(cashOffer.toFixed(2)),
+      marginUsed: marginOverride,
+      lastSynced: new Date().toISOString(),
+      dateAdded: new Date().toISOString(),
+      source: "appraisal",
+    });
+    pushToast(`Added ${selectedCard.name} to inventory.`, "success");
+    resetDraft();
+  };
+
+  return html`
+    <div class="max-w-3xl mx-auto px-4 py-5 space-y-5">
+
+      <!-- Search -->
+      <div class="relative">
+        <div class="relative">
+          <i data-lucide="search" class="absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500" style=${{ width: 17, height: 17 }}></i>
+          <input value=${query} onInput=${(e) => onQueryChange(e.target.value)}
+            onFocus=${() => suggestions.length && setShowSuggestions(true)}
+            placeholder="Search a card by name…"
+            class="w-full rounded-xl bg-white/[.05] border border-white/10 pl-10 pr-10 py-3.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus-ring focus:border-white/20" />
+          ${searchLoading ? html`<i data-lucide="loader-2" class="absolute right-3.5 top-1/2 -translate-y-1/2 text-zinc-500 animate-spin" style=${{ width: 16, height: 16 }}></i>` : null}
+        </div>
+
+        ${showSuggestions && suggestions.length > 0 ? html`
+          <div class="absolute z-20 mt-2 w-full rounded-xl border border-white/10 bg-[#14171B] shadow-2xl overflow-hidden animate-slide-up">
+            ${searchNotice?.cached ? html`
+              <div class="px-3.5 py-2 text-[11px] text-amber-300 bg-amber-500/10 border-b border-amber-500/20 flex items-center gap-1.5">
+                <i data-lucide="wifi-off" style=${{ width: 12, height: 12 }}></i> Offline — showing cached results from ${timeAgo(searchNotice.cachedAt)}
+              </div>` : null}
+            <div class="max-h-80 overflow-y-auto">
+              ${suggestions.map((c) => html`
+                <button key=${c.id} onClick=${() => pickCard(c)}
+                  class="w-full flex items-center gap-3 px-3.5 py-2.5 hover:bg-white/[.06] text-left transition-colors border-b border-white/[.04] last:border-0">
+                  ${c.images?.small ? html`<img src=${c.images.small} class="w-8 h-11 object-contain rounded" loading="lazy" />` : html`<div class="w-8 h-11 rounded bg-white/5 flex items-center justify-center"><i data-lucide="image" style=${{ width: 14, height: 14 }} class="text-zinc-600"></i></div>`}
+                  <div class="min-w-0 flex-1">
+                    <div class="text-sm text-zinc-100 truncate">${c.name}</div>
+                    <div class="text-xs text-zinc-500 truncate">${c.set?.name || "—"} · #${c.number || "?"}</div>
+                  </div>
+                <//>`)}
+            </div>
+          </div>` : null}
+      </div>
+
+      ${!selectedCard ? html`
+        <div class="rounded-2xl border border-dashed border-white/10 py-16 text-center text-zinc-600">
+          <i data-lucide="search" style=${{ width: 28, height: 28 }} class="mx-auto mb-3 opacity-50"></i>
+          <p class="text-sm">Search for a card to begin an appraisal.</p>
+        </div>` : html`
+
+        <!-- Selected card preview -->
+        <div class="rounded-2xl border border-white/10 bg-white/[.03] p-4 sm:p-5 flex gap-4">
+          <div class="relative shrink-0 w-20 sm:w-24 rounded-lg overflow-hidden border border-white/10">
+            ${selectedCard.images?.small ? html`<img src=${selectedCard.images.small} class="w-full h-full object-contain bg-[#0e1013]" />` : null}
+            <div class="absolute inset-0 foil-sheen pointer-events-none"></div>
+          </div>
+          <div class="min-w-0 flex-1 space-y-2">
+            <div>
+              <div class="text-lg font-semibold text-zinc-50 truncate">${selectedCard.name}</div>
+              <div class="text-xs text-zinc-500">${selectedCard.set?.name} · #${selectedCard.number} · ${selectedCard.rarity || "—"}</div>
+            </div>
+            ${availableVariants(selectedCard).length > 0 ? html`
+              <div class="flex flex-wrap gap-1.5">
+                ${availableVariants(selectedCard).map((v) => html`
+                  <button key=${v} onClick=${() => setVariantKey(v)}
+                    class=${clsx("px-2.5 py-1 rounded-md text-xs border transition-colors", variantKey === v ? "text-white border-transparent" : "border-white/10 text-zinc-400 hover:text-zinc-200")}
+                    style=${variantKey === v ? { backgroundColor: "var(--accent)" } : undefined}>
+                    ${VARIANT_LABELS[v] || v}
+                  <//>`)}
+              </div>` : html`<div class="text-xs text-amber-400">No TCGplayer pricing variants found — you'll need to price this one manually.</div>`}
+            <button onClick=${resetDraft} class="text-xs text-zinc-500 hover:text-zinc-300 underline decoration-dotted">Clear selection</button>
+          </div>
+        </div>
+
+        <!-- Manual scan trigger -->
+        <${Button} size="lg" className="w-full" onClick=${runScan} disabled=${scanLoading}>
+          <i data-lucide=${scanLoading ? "loader-2" : "scan-line"} class=${scanLoading ? "animate-spin" : ""} style=${{ width: 17, height: 17 }}></i>
+          ${scanLoading ? "Scanning market prices…" : "Run Market Price Scan"}
+        <//>
+        ${scanMeta?.fromCache ? html`<p class="text-xs text-amber-400 -mt-2">Offline — showing prices cached ${timeAgo(scanMeta.cachedAt)}.</p>` : null}
+        ${scanError ? html`<p class="text-xs text-red-400 -mt-2">${scanError}</p>` : null}
+
+        ${bucketPrices ? html`
+          <div class="space-y-4">
+            <div class="flex items-center justify-between">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">Condition &amp; pricing</h3>
+              <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                <input type="checkbox" checked=${overrideOn} onChange=${(e) => setOverrideOn(e.target.checked)} class="accent-[var(--accent)]" />
+                Manual override
+              </label>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              ${CONDITION_BUCKETS.map((b) => {
+                const val = bucketPrice(b.key);
+                const active = selectedBucket === b.key;
+                return html`
+                  <button key=${b.key} onClick=${() => setSelectedBucket(b.key)}
+                    class=${clsx("text-left rounded-xl border p-3.5 transition-colors", active ? "border-transparent" : "border-white/10 hover:border-white/20")}
+                    style=${active ? { backgroundColor: "var(--accent-soft)", borderColor: "var(--accent)" } : undefined}>
+                    <div class="flex items-center justify-between">
+                      <${Badge} tone=${active ? "zinc" : "zinc"}>${b.label}<//>
+                      ${active ? html`<i data-lucide="check" style=${{ width: 14, height: 14 }} class="text-zinc-200"></i>` : null}
+                    </div>
+                    <div class="mt-2">
+                      ${overrideOn || val == null ? html`
+                        <${NumberInput} value=${val ?? ""} onChange=${(v) => setBucketPrices((p) => ({ ...p, [b.key]: v === "" ? null : v }))} min=${0} step="0.01" suffix="$" />
+                      ` : html`<div class="text-xl font-semibold font-tabular text-zinc-50">${formatCurrency(val)}</div>`}
+                    </div>
+                    <div class="text-[11px] text-zinc-500 mt-1">${b.sub}</div>
+                  <//>`;
+              })}
+            </div>
+
+            <div class="rounded-2xl border border-white/10 bg-white/[.03] p-4 sm:p-5 space-y-4">
+              <div class="grid grid-cols-2 gap-3">
+                <${Field} label=${`Margin — ${marginOverride}%`}>
+                  <input type="range" min="10" max="100" value=${marginOverride} onInput=${(e) => setMarginOverride(Number(e.target.value))} class="w-full accent-[var(--accent)]" />
+                <//>
+                <${Field} label="Quantity">
+                  <${NumberInput} value=${quantity} onChange=${setQuantity} min=${1} />
+                <//>
+              </div>
+              <${Field} label="Cost basis (optional)" hint="Defaults to the cash offer below if left blank.">
+                <${NumberInput} value=${costBasis} onChange=${setCostBasis} min=${0} step="0.01" suffix="$" />
+              <//>
+
+              <div class="flex items-center justify-between rounded-xl bg-black/30 border border-white/10 px-4 py-3">
+                <span class="text-sm text-zinc-400">Cash Buy Offer</span>
+                <span class="text-2xl font-bold font-tabular" style=${{ color: "var(--ring)" }}>${cashOffer != null ? formatCurrency(cashOffer) : "—"}</span>
+              </div>
+
+              <${Button} size="lg" className="w-full" disabled=${cashOffer == null} onClick=${confirmBuy}>
+                <i data-lucide="shopping-cart" style=${{ width: 16, height: 16 }}></i> Buy &amp; Move to Store Inventory
+              <//>
+            </div>
+          </div>` : null}
+      `}
+    </div>`;
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * CSV import (archive upload) for bulk-loading existing collections
+ * ---------------------------------------------------------------------- */
+
+function normalizeCondition(raw) {
+  const s = (raw || "").toString().trim().toLowerCase();
+  if (!s) return "nm";
+  if (s.includes("grad") || s.includes("psa") || s.includes("bgs") || s.includes("cgc")) return "graded";
+  if (s === "nm" || s.includes("near mint") || s.includes("mint")) return "nm";
+  if (s === "lp" || s.includes("light")) return "lp";
+  if (s === "mp" || s === "hp" || s === "dmg" || s.includes("play") || s.includes("damag") || s.includes("heavy")) return "mp";
+  return "nm";
+}
+
+function downloadCsvTemplate() {
+  const sample = [
+    CSV_TEMPLATE_HEADERS.join(","),
+    `Charizard,Base Set,4,NM,holofoil,1,120.00,`,
+    `Pikachu,Base Set,58,LP,normal,3,2.50,`,
+  ].join("\n");
+  downloadText(sample, "card-vault-import-template.csv", "text/csv");
+}
+
+function CsvImportModal({ open, onClose, onConfirm }) {
+  const [rows, setRows] = useState([]);
+  const [fileName, setFileName] = useState("");
+  const [parseError, setParseError] = useState(null);
+  const fileRef = useRef(null);
+
+  const handleFile = (file) => {
+    setParseError(null);
+    setFileName(file.name);
+    window.Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (res) => {
+        if (!res.data.length) { setParseError("No rows found in that file."); return; }
+        const mapped = res.data.map((r) => {
+          const get = (name) => r[name] ?? r[name.toLowerCase()] ?? r[name.toUpperCase()] ?? "";
+          return {
+            id: uid(),
+            cardId: null,
+            name: get("Card Name") || get("Name") || "Untitled card",
+            setName: get("Set Name") || get("Set") || "",
+            cardNumber: get("Card Number") || get("Number") || "",
+            imageSmall: "",
+            variant: (get("Variant") || "normal").toString(),
+            condition: normalizeCondition(get("Condition")),
+            conditionLabel: (CONDITION_BUCKETS.find((b) => b.key === normalizeCondition(get("Condition"))) || {}).label || "Raw Near Mint (NM)",
+            quantity: Math.max(1, parseInt(get("Quantity"), 10) || 1),
+            costBasis: parseFloat(get("Cost Basis")) || 0,
+            marketPriceSnapshot: null,
+            cashOfferAtSync: null,
+            marginUsed: null,
+            notes: get("Notes") || "",
+            lastSynced: null,
+            dateAdded: new Date().toISOString(),
+            source: "csv-import",
+          };
+        });
+        setRows(mapped);
+      },
+      error: (err) => setParseError(err.message || "Could not parse this CSV."),
+    });
+  };
+
+  const reset = () => { setRows([]); setFileName(""); setParseError(null); };
+
+  return html`
+    <${Modal} open=${open} onClose=${() => { reset(); onClose(); }} title="Import collection from CSV" wide=${true}>
+      <div class="space-y-4">
+        <p class="text-sm text-zinc-400">Bulk-load an existing collection or archive. Columns are matched by header name (case-insensitive).</p>
+        <div class="flex flex-wrap items-center gap-2.5">
+          <${Button} variant="outline" onClick=${() => fileRef.current?.click()}>
+            <i data-lucide="upload" style=${{ width: 15, height: 15 }}></i> Choose CSV file
+          <//>
+          <${Button} variant="ghost" onClick=${downloadCsvTemplate}>
+            <i data-lucide="file-down" style=${{ width: 15, height: 15 }}></i> Download template
+          <//>
+          ${fileName ? html`<span class="text-xs text-zinc-500">${fileName}</span>` : null}
+        </div>
+        <input ref=${fileRef} type="file" accept=".csv,text/csv" class="hidden"
+          onChange=${(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ""; }} />
+
+        ${parseError ? html`<p class="text-sm text-red-400">${parseError}</p>` : null}
+
+        ${rows.length > 0 ? html`
+          <div class="space-y-2">
+            <p class="text-xs text-zinc-500">${rows.length} row(s) detected. Preview of the first 5:</p>
+            <div class="rounded-lg border border-white/10 overflow-x-auto">
+              <table class="w-full text-xs">
+                <thead class="bg-white/[.04] text-zinc-400">
+                  <tr>
+                    <th class="text-left px-3 py-2 font-medium">Name</th>
+                    <th class="text-left px-3 py-2 font-medium">Set</th>
+                    <th class="text-left px-3 py-2 font-medium">Condition</th>
+                    <th class="text-left px-3 py-2 font-medium">Qty</th>
+                    <th class="text-left px-3 py-2 font-medium">Cost basis</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows.slice(0, 5).map((r) => html`
+                    <tr key=${r.id} class="border-t border-white/5">
+                      <td class="px-3 py-2 text-zinc-200">${r.name}</td>
+                      <td class="px-3 py-2 text-zinc-400">${r.setName}</td>
+                      <td class="px-3 py-2 text-zinc-400">${r.conditionLabel}</td>
+                      <td class="px-3 py-2 text-zinc-400 font-tabular">${r.quantity}</td>
+                      <td class="px-3 py-2 text-zinc-400 font-tabular">${formatCurrency(r.costBasis)}</td>
+                    </tr>`)}
+                </tbody>
+              </table>
+            </div>
+            <div class="flex justify-end gap-2 pt-2">
+              <${Button} variant="ghost" onClick=${() => { reset(); }}>Start over<//>
+              <${Button} onClick=${() => { onConfirm(rows); reset(); onClose(); }}>
+                <i data-lucide="archive" style=${{ width: 15, height: 15 }}></i> Import ${rows.length} card(s)
+              <//>
+            </div>
+          </div>` : null}
+      </div>
+    <//>`;
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * Tab 2 — Master Store Inventory
+ * ---------------------------------------------------------------------- */
+
+function InventoryTab({ inventory, setInventory, settings, online, pushToast, bumpModCounter }) {
+  const [search, setSearch] = useState("");
+  const [csvOpen, setCsvOpen] = useState(false);
+  const [syncingId, setSyncingId] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return inventory;
+    return inventory.filter((i) => (i.name + " " + i.setName).toLowerCase().includes(q));
+  }, [inventory, search]);
+
+  const totals = useMemo(() => {
+    return inventory.reduce((acc, i) => {
+      acc.items += 1;
+      acc.qty += i.quantity || 0;
+      acc.cost += (i.costBasis || 0) * (i.quantity || 1);
+      acc.value += (i.marketPriceSnapshot != null ? i.marketPriceSnapshot : (i.costBasis || 0)) * (i.quantity || 1);
+      return acc;
+    }, { items: 0, qty: 0, cost: 0, value: 0 });
+  }, [inventory]);
+
+  const removeItem = (id) => {
+    setInventory((inv) => inv.filter((i) => i.id !== id));
+    bumpModCounter();
+    setConfirmDeleteId(null);
+    pushToast("Removed from inventory.", "info");
+  };
+
+  const importCsvRows = (rows) => {
+    setInventory((inv) => [...rows, ...inv]);
+    bumpModCounter();
+    pushToast(`Imported ${rows.length} card(s) from CSV.`, "success");
+  };
+
+  const syncRow = async (item) => {
+    if (!item.cardId) { pushToast("This row has no linked card ID (likely CSV-imported) — sync isn't available, edit manually.", "info"); return; }
+    setSyncingId(item.id);
+    try {
+      const { data: card, fromCache, cachedAt } = await fetchCardById(item.cardId, settings.pokemonApiKey);
+      const variantKey = item.variant && card?.tcgplayer?.prices?.[item.variant] ? item.variant : availableVariants(card)[0];
+      const computed = variantKey ? computeConditionPrices(card, variantKey, settings.pricingBasis) : null;
+      if (!computed) { pushToast("No live pricing available for this card right now.", "error"); return; }
+      const price = item.condition === "graded" ? item.marketPriceSnapshot : computed[item.condition] ?? computed.nm;
+      setInventory((inv) => inv.map((i) => i.id === item.id ? {
+        ...i,
+        marketPriceSnapshot: Number(price.toFixed(2)),
+        cashOfferAtSync: Number((price * ((i.marginUsed || settings.marginPercent) / 100)).toFixed(2)),
+        lastSynced: new Date().toISOString(),
+      } : i));
+      pushToast(fromCache ? `Synced from cache (offline) — ${timeAgo(cachedAt)}.` : "Valuation synced.", fromCache ? "info" : "success");
+    } catch (err) {
+      pushToast("Sync failed — no connection and nothing cached for this card.", "error");
+    } finally {
+      setSyncingId(null);
+    }
+  };
+
+  return html`
+    <div class="max-w-6xl mx-auto px-4 py-5 space-y-5">
+
+      <!-- Toolbar -->
+      <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+        <div class="relative flex-1">
+          <i data-lucide="search" class="absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500" style=${{ width: 16, height: 16 }}></i>
+          <input value=${search} onInput=${(e) => setSearch(e.target.value)} placeholder="Filter inventory…"
+            class="w-full rounded-xl bg-white/[.05] border border-white/10 pl-10 pr-3 py-2.5 text-sm placeholder:text-zinc-600 focus-ring focus:border-white/20" />
+        </div>
+        <${Button} variant="outline" onClick=${() => setCsvOpen(true)}>
+          <i data-lucide="archive" style=${{ width: 15, height: 15 }}></i> Import archive (CSV)
+        <//>
+      </div>
+
+      <!-- Totals -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        ${[
+          ["Items", totals.items, false],
+          ["Total qty", totals.qty, false],
+          ["Cost basis", formatCurrency(totals.cost), true],
+          ["Est. value", formatCurrency(totals.value), true],
+        ].map(([label, val]) => html`
+          <div key=${label} class="rounded-xl border border-white/10 bg-white/[.03] px-3.5 py-3">
+            <div class="text-[11px] text-zinc-500">${label}</div>
+            <div class="text-lg font-semibold font-tabular text-zinc-100">${val}</div>
+          </div>`)}
+      </div>
+
+      ${filtered.length === 0 ? html`
+        <div class="rounded-2xl border border-dashed border-white/10 py-16 text-center text-zinc-600">
+          <i data-lucide="package" style=${{ width: 28, height: 28 }} class="mx-auto mb-3 opacity-50"></i>
+          <p class="text-sm">${inventory.length === 0 ? "No inventory yet — buy a card in the Appraisal tab or import a CSV archive." : "No rows match that filter."}</p>
+        </div>` : html`
+
+        <!-- Desktop table -->
+        <div class="hidden md:block rounded-xl border border-white/10 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead class="bg-white/[.04] text-zinc-500 text-xs">
+              <tr>
+                <th class="text-left px-3.5 py-2.5 font-medium">Card</th>
+                <th class="text-left px-3.5 py-2.5 font-medium">Condition</th>
+                <th class="text-left px-3.5 py-2.5 font-medium">Qty</th>
+                <th class="text-left px-3.5 py-2.5 font-medium">Cost basis</th>
+                <th class="text-left px-3.5 py-2.5 font-medium">Market price</th>
+                <th class="text-left px-3.5 py-2.5 font-medium">Last synced</th>
+                <th class="text-right px-3.5 py-2.5 font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.map((item) => html`
+                <tr key=${item.id} class="border-t border-white/5 hover:bg-white/[.02]">
+                  <td class="px-3.5 py-2.5">
+                    <div class="flex items-center gap-2.5">
+                      ${item.imageSmall ? html`<img src=${item.imageSmall} class="w-7 h-9 object-contain rounded" loading="lazy" />` : html`<div class="w-7 h-9 rounded bg-white/5"></div>`}
+                      <div class="min-w-0">
+                        <div class="text-zinc-100 truncate">${item.name}</div>
+                        <div class="text-xs text-zinc-500 truncate">${item.setName}${item.variant ? " · " + (VARIANT_LABELS[item.variant] || item.variant) : ""}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="px-3.5 py-2.5"><${Badge}>${item.conditionLabel || item.condition}<//></td>
+                  <td class="px-3.5 py-2.5 font-tabular">${item.quantity}</td>
+                  <td class="px-3.5 py-2.5 font-tabular">${formatCurrency(item.costBasis)}</td>
+                  <td class="px-3.5 py-2.5 font-tabular">${item.marketPriceSnapshot != null ? formatCurrency(item.marketPriceSnapshot) : "—"}</td>
+                  <td class="px-3.5 py-2.5 text-xs text-zinc-500">${timeAgo(item.lastSynced)}</td>
+                  <td class="px-3.5 py-2.5">
+                    <div class="flex items-center justify-end gap-1.5">
+                      <${IconBtn} name=${syncingId === item.id ? "loader-2" : "refresh-cw"} title="Sync valuation" onClick=${() => syncRow(item)} className=${syncingId === item.id ? "animate-spin" : ""} />
+                      <${IconBtn} name="trash-2" title="Remove" onClick=${() => setConfirmDeleteId(item.id)} className="hover:text-red-300 hover:bg-red-500/10" />
+                    </div>
+                  </td>
+                </tr>`)}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Mobile stacked cards -->
+        <div class="md:hidden space-y-2.5">
+          ${filtered.map((item) => html`
+            <div key=${item.id} class="rounded-xl border border-white/10 bg-white/[.03] p-3.5 flex gap-3">
+              ${item.imageSmall ? html`<img src=${item.imageSmall} class="w-12 h-16 object-contain rounded shrink-0" loading="lazy" />` : html`<div class="w-12 h-16 rounded bg-white/5 shrink-0"></div>`}
+              <div class="min-w-0 flex-1 space-y-1.5">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <div class="text-sm text-zinc-100 truncate">${item.name}</div>
+                    <div class="text-xs text-zinc-500 truncate">${item.setName}</div>
+                  </div>
+                  <${Badge}>${item.conditionLabel || item.condition}<//>
+                </div>
+                <div class="flex items-center justify-between text-xs text-zinc-400 font-tabular">
+                  <span>Qty ${item.quantity} · Cost ${formatCurrency(item.costBasis)}</span>
+                  <span class="text-zinc-200">${item.marketPriceSnapshot != null ? formatCurrency(item.marketPriceSnapshot) : "—"}</span>
+                </div>
+                <div class="flex items-center justify-between pt-1">
+                  <span class="text-[11px] text-zinc-600">Synced ${timeAgo(item.lastSynced)}</span>
+                  <div class="flex items-center gap-1.5">
+                    <${IconBtn} size=${16} name=${syncingId === item.id ? "loader-2" : "refresh-cw"} title="Sync" onClick=${() => syncRow(item)} className=${syncingId === item.id ? "animate-spin" : ""} />
+                    <${IconBtn} size=${16} name="trash-2" title="Remove" onClick=${() => setConfirmDeleteId(item.id)} className="hover:text-red-300 hover:bg-red-500/10" />
+                  </div>
+                </div>
+              </div>
+            </div>`)}
+        </div>
+      `}
+    </div>
+
+    <${CsvImportModal} open=${csvOpen} onClose=${() => setCsvOpen(false)} onConfirm=${importCsvRows} />
+
+    <${Modal} open=${!!confirmDeleteId} onClose=${() => setConfirmDeleteId(null)} title="Remove card?">
+      <p class="text-sm text-zinc-400 mb-4">This removes the row from your inventory on this device. This can't be undone unless you have a JSON backup.</p>
+      <div class="flex justify-end gap-2">
+        <${Button} variant="ghost" onClick=${() => setConfirmDeleteId(null)}>Cancel<//>
+        <${Button} variant="danger" onClick=${() => removeItem(confirmDeleteId)}>Remove<//>
+      <//>
+    <//>`;
+}
+
+
+/* ---------------------------------------------------------------------- *
+ * App root
+ * ---------------------------------------------------------------------- */
+
+function mergeInventory(existing, incoming) {
+  const byId = new Map(existing.map((i) => [i.id, i]));
+  incoming.forEach((i) => byId.set(i.id, i));
+  return Array.from(byId.values());
+}
+
+function App() {
+  const [settings, setSettings] = usePersistentState(STORAGE_KEYS.settings, DEFAULT_SETTINGS);
+  const [inventory, setInventory] = usePersistentState(STORAGE_KEYS.inventory, []);
+  const [modCounter, setModCounter] = usePersistentState(STORAGE_KEYS.modCounter, 0);
+  const [tab, setTab] = useState("appraisal");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const online = useOnlineStatus();
+  const { toasts, push: pushToast, dismiss } = useToasts();
+  useLucideIcons([tab, settingsOpen, inventory, settings]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-accent", settings.themeAccent);
+    const meta = document.querySelector('meta[name="theme-color"]');
+    const map = { crimson: "#C22B26", cobalt: "#2354C7", emerald: "#1F7A52", electric: "#B5900B" };
+    if (meta) meta.setAttribute("content", map[settings.themeAccent] || "#C22B26");
+    document.title = `${settings.shopName} — Card Vault`;
+  }, [settings.themeAccent, settings.shopName]);
+
+  // Auto-backup: watches inventory for any addition/update/deletion and
+  // downloads a timestamped snapshot once the configured threshold is hit.
+  const skipFirst = useRef(true);
+  useEffect(() => {
+    if (skipFirst.current) { skipFirst.current = false; return; }
+    setModCounter((c) => c + 1);
+  }, [inventory]);
+
+  useEffect(() => {
+    if (!settings.autoBackupEnabled) return;
+    if (modCounter > 0 && modCounter >= settings.autoBackupThreshold) {
+      downloadJSON({ settings, inventory, exportedAt: new Date().toISOString(), auto: true }, `card-vault-autobackup-${timestampForFilename()}.json`);
+      pushToast(`Auto-backup saved after ${settings.autoBackupThreshold} changes.`, "info");
+      setModCounter(0);
+    }
+  }, [modCounter, settings.autoBackupEnabled, settings.autoBackupThreshold]);
+
+  const onExport = () => {
+    downloadJSON({ settings, inventory, exportedAt: new Date().toISOString() }, `card-vault-backup-${timestampForFilename()}.json`);
+    pushToast("Backup exported.", "success");
+  };
+
+  const onImport = (file, merge) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        if (parsed.settings) setSettings((s) => ({ ...s, ...parsed.settings }));
+        if (Array.isArray(parsed.inventory)) {
+          setInventory((inv) => merge ? mergeInventory(inv, parsed.inventory) : parsed.inventory);
+        }
+        pushToast(`Backup ${merge ? "merged" : "restored"}.`, "success");
+      } catch (err) {
+        pushToast("That file doesn't look like a Card Vault backup.", "error");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const onBuy = (item) => setInventory((inv) => [item, ...inv]);
+  const noop = () => {};
+
+  const NAV = [
+    { key: "appraisal", label: "Appraisal", icon: "calculator" },
+    { key: "inventory", label: "Inventory", icon: "package" },
+  ];
+
+  return html`
+    <div class="min-h-screen flex flex-col pb-16 sm:pb-0">
+      <${OfflineBanner} online=${online} />
+
+      <header class="sticky top-0 z-30 border-b border-white/10 bg-[#0B0D10]/90 backdrop-blur">
+        <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
+          <div class="flex items-center gap-2.5 min-w-0">
+            <span class="w-2.5 h-2.5 rounded-full shrink-0" style=${{ backgroundColor: "var(--accent)" }}></span>
+            <h1 class="text-sm sm:text-base font-semibold truncate">${settings.shopName}</h1>
+          </div>
+
+          <nav class="hidden sm:flex items-center gap-1 bg-white/[.04] rounded-xl p-1">
+            ${NAV.map((n) => html`
+              <button key=${n.key} onClick=${() => setTab(n.key)}
+                class=${clsx("flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-sm transition-colors", tab === n.key ? "text-white" : "text-zinc-400 hover:text-zinc-200")}
+                style=${tab === n.key ? { backgroundColor: "var(--accent)" } : undefined}>
+                <i data-lucide=${n.icon} style=${{ width: 15, height: 15 }}></i> ${n.label}
+              </button>`)}
+          </nav>
+
+          <div class="flex items-center gap-2">
+            ${!online ? html`<i data-lucide="wifi-off" class="text-amber-400" style=${{ width: 16, height: 16 }} title="Offline"></i>` : null}
+            <${IconBtn} name="settings" title="Settings" onClick=${() => setSettingsOpen(true)} />
+          </div>
+        </div>
+      </header>
+
+      <main class="flex-1">
+        ${tab === "appraisal"
+          ? html`<${AppraisalTab} settings=${settings} online=${online} pushToast=${pushToast} onBuy=${onBuy} />`
+          : html`<${InventoryTab} inventory=${inventory} setInventory=${setInventory} settings=${settings} online=${online} pushToast=${pushToast} bumpModCounter=${noop} />`}
+      </main>
+
+      <!-- Mobile bottom nav -->
+      <nav class="sm:hidden fixed bottom-0 inset-x-0 z-30 border-t border-white/10 bg-[#0B0D10]/95 backdrop-blur flex">
+        ${NAV.map((n) => html`
+          <button key=${n.key} onClick=${() => setTab(n.key)}
+            class=${clsx("flex-1 flex flex-col items-center gap-1 py-2.5 text-xs", tab === n.key ? "text-white" : "text-zinc-500")}>
+            <i data-lucide=${n.icon} style=${{ width: 18, height: 18, color: tab === n.key ? "var(--accent)" : undefined }}></i>
+            ${n.label}
+          </button>`)}
+      </nav>
+
+      <${SettingsDrawer} open=${settingsOpen} onClose=${() => setSettingsOpen(false)}
+        settings=${settings} setSettings=${setSettings} onExport=${onExport} onImport=${onImport} inventoryCount=${inventory.length} />
+
+      <${ToastStack} toasts=${toasts} dismiss=${dismiss} />
+    </div>`;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(html`<${App} />`);
+
+// Register the service worker so the app shell + CDN libraries are cached
+// for offline use after the first successful load (see sw.js / README.md).
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch((err) => console.warn("SW registration failed:", err));
+  });
+}
+</script>
+</body>
+</html>
