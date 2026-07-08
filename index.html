@@ -258,17 +258,42 @@ async function fetchWithRetry(url, options = {}, { retries = 2, timeoutMs = 9000
     try {
       const res = await fetch(url, { ...options, signal: controller.signal });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+      if (!res.ok) {
+        const httpErr = new Error(`Request failed (${res.status})`);
+        httpErr.kind = "http";
+        httpErr.status = res.status;
+        // A 429/404/500 etc. means we *did* reach the server — retrying
+        // immediately won't help for a 404, and for a 429 it'll just dig
+        // the hole deeper, so don't burn retries on non-network failures.
+        throw httpErr;
+      }
       return await res.json();
     } catch (err) {
       clearTimeout(timer);
       lastErr = err;
+      if (err.kind === "http") break; // don't retry real HTTP errors
+      if (err.name === "AbortError") { err.kind = "timeout"; }
+      else if (!err.kind) { err.kind = "network"; } // TypeError: Failed to fetch — offline, DNS, or CORS
       attempt += 1;
       if (attempt > retries) break;
       await new Promise((r) => setTimeout(r, backoffMs * attempt));
     }
   }
   throw lastErr || new Error("Request failed");
+}
+
+// Turns a fetchWithRetry error into a message that actually says what
+// happened, instead of always blaming "no connection."
+function describeFetchError(err) {
+  if (err?.kind === "http") {
+    if (err.status === 429) return "Hit the pokemontcg.io rate limit (30 requests/min, 1,000/day without a key). Add a free API key in Settings, or wait a minute and try again.";
+    if (err.status === 404) return "That card ID wasn't found on pokemontcg.io.";
+    if (err.status >= 500) return `pokemontcg.io is having issues (HTTP ${err.status}). Try again shortly.`;
+    return `Request rejected (HTTP ${err.status}).`;
+  }
+  if (err?.kind === "timeout") return "The request timed out. Your connection may be slow — try again.";
+  if (!navigator.onLine) return "You're offline.";
+  return "Couldn't reach pokemontcg.io. If you're opening this file directly from disk (a file:// address) rather than a hosted URL, some browsers block that — try GitHub Pages or a local server instead.";
 }
 
 function cacheGet(key) {
@@ -648,7 +673,7 @@ function AppraisalTab({ settings, online, pushToast, onBuy }) {
     } catch (err) {
       setSuggestions([]);
       setShowSuggestions(false);
-      pushToast("Card lookup failed — check your connection and try again.", "error");
+      pushToast(`Card lookup failed — ${describeFetchError(err)}`, "error");
     } finally {
       setSearchLoading(false);
     }
@@ -690,7 +715,7 @@ function AppraisalTab({ settings, online, pushToast, onBuy }) {
         if (fromCache) pushToast("Showing last cached prices — you're offline.", "info");
       }
     } catch (err) {
-      setScanError("Price scan failed — no connection and no cached price for this card. You can still enter values manually.");
+      setScanError(`Price scan failed — ${describeFetchError(err)} No cached price for this card either — you can enter values manually below.`);
       setBucketPrices({ graded: null, nm: null, lp: null, mp: null });
       setOverrideOn(true);
     } finally {
@@ -1050,7 +1075,7 @@ function InventoryTab({ inventory, setInventory, settings, online, pushToast, bu
       } : i));
       pushToast(fromCache ? `Synced from cache (offline) — ${timeAgo(cachedAt)}.` : "Valuation synced.", fromCache ? "info" : "success");
     } catch (err) {
-      pushToast("Sync failed — no connection and nothing cached for this card.", "error");
+      pushToast(`Sync failed — ${describeFetchError(err)}`, "error");
     } finally {
       setSyncingId(null);
     }
